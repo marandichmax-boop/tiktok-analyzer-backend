@@ -1,11 +1,10 @@
-# Node + ffmpeg + yt-dlp (venv) — reliable on Render
 FROM node:18-bookworm
 
 RUN apt-get update && \
     apt-get install -y ffmpeg python3 python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
-# Put yt-dlp in an isolated venv to avoid Debian pip restrictions
+# yt-dlp in venv (stable on Render)
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 RUN pip install --no-cache-dir yt-dlp
