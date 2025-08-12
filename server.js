@@ -1,13 +1,4 @@
-// TikTok Analyzer Backend (full file)
-// - Accepts TikTok link -> resolves media via yt-dlp (mobile UA + extractor args)
-// - Transcribes via AssemblyAI
-// - Runs quick heuristic analysis
-// - Stores jobs + scripts in SQLite (better-sqlite3)
-// Endpoints:
-//   POST /jobs { tiktokUrl } -> { id, status }
-//   GET  /jobs/:id           -> { status, transcript, analysis, ... }
-//   POST /scripts            -> { id }
-//   GET  /scripts            -> list saved
+// TikTok Analyzer Backend (with robust resolver + logging)
 
 import express from "express";
 import cors from "cors";
@@ -17,14 +8,14 @@ import fetch from "node-fetch";
 import { promisify } from "util";
 
 const exec = promisify(execFile);
-const AAI_KEY = process.env.AAI_KEY; // <- set this in Render Environment
-const PORT = process.env.PORT || 3000;
+const AAI_KEY = process.env.AAI_KEY;            // set in Render Environment
+const PORT   = process.env.PORT || 3000;
 
+// ---------- App & DB ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------- DB ----------
 const db = new Database("data.db");
 db.exec(`
 CREATE TABLE IF NOT EXISTS jobs (
@@ -50,17 +41,15 @@ CREATE TABLE IF NOT EXISTS scripts (
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const now = () => new Date().toISOString();
 
-// ---------- Analysis ----------
+// ---------- Helpers ----------
 function analyzeTranscript(txt) {
   const lower = (txt || "").toLowerCase();
   const metrics = {
     length_chars: txt.length,
     length_words: (txt.match(/\b\w+\b/g) || []).length,
     has_numbers: /\d/.test(lower),
-    power_words:
-      lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || [],
-    risky_claims:
-      lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || [],
+    power_words: (lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || []),
+    risky_claims: (lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || []),
     cta_lines: (txt.match(/(link|buy|shop|tap|order|try|today|now)[^\n]*$/gim) || []),
   };
   const hasHook = /^[^\n]{1,150}/.test(txt);
@@ -69,7 +58,6 @@ function analyzeTranscript(txt) {
     (metrics.has_numbers ? 0.2 : 0) +
     (hasHook ? 0.3 : 0) +
     (metrics.length_words >= 30 && metrics.length_words <= 220 ? 0.2 : 0);
-
   const structure = {
     prehook: txt.split("\n")[0] || "",
     cta: metrics.cta_lines.slice(-1)[0] || "",
@@ -78,8 +66,45 @@ function analyzeTranscript(txt) {
   return { metrics, hook_score: +hookScore.toFixed(2), structure };
 }
 
-// ---------- TikTok resolver (yt-dlp with mobile UA + extractor args) ----------
+// Try to coerce to a clean share link if user pasted a long webapp URL
+function normalizeTikTokUrl(input) {
+  try {
+    const u = new URL(input);
+    // If it's already a share link, keep it
+    if (/tiktok\.com$/i.test(u.hostname) && /\/video\/\d+/.test(u.pathname)) return input;
+
+    // Some long URLs contain the numeric video id in a query string; extract it
+    const idInQS =
+      u.searchParams.get("video_id") ||
+      u.searchParams.get("item_id") ||
+      (u.pathname.match(/\/video\/(\d+)/)?.[1]) ||
+      (u.search.match(/[\?&](?:video_id|item_id)=(\d+)/)?.[1]);
+
+    if (idInQS) {
+      // Username is not required: /video/<id> works
+      return `https://www.tiktok.com/video/${idInQS}`;
+    }
+  } catch {}
+  return input; // fallback to original; yt-dlp may still handle it
+}
+
+async function execYtDlp(args) {
+  try {
+    const { stdout, stderr } = await exec("yt-dlp", args);
+    if (stderr?.trim()) console.warn("[yt-dlp stderr]", stderr.trim());
+    return { ok: true, stdout: stdout.trim(), stderr: stderr?.trim() || "" };
+  } catch (e) {
+    const out = (e.stdout || "").toString().trim();
+    const err = (e.stderr || e.message || String(e)).toString().trim();
+    console.warn("[yt-dlp FAIL]", err);
+    return { ok: false, stdout: out, stderr: err };
+  }
+}
+
+// ---------- TikTok resolver (mobile UA + extractor args + fallbacks) ----------
 async function resolveDirectMedia(tiktokUrl) {
+  const url = normalizeTikTokUrl(tiktokUrl);
+
   const common = [
     "--no-warnings",
     "--geo-bypass",
@@ -89,36 +114,30 @@ async function resolveDirectMedia(tiktokUrl) {
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
   ];
 
-  // 1) Mobile API path (more reliable)
+  // 1) Best AUDIO first (fastest & least blocked for transcription)
   let args = [
     ...common,
     "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
-    "-g", tiktokUrl
+    "-g", "-f", "bestaudio/best", url
   ];
-  try {
-    const { stdout } = await exec("yt-dlp", args);
-    const url = stdout.trim().split("\n").pop();
-    if (url) return url;
-  } catch (e) {
-    console.warn("yt-dlp mobile path failed:", e?.stderr || e?.message || e);
-  }
+  let r = await execYtDlp(args);
+  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
 
-  // 2) Generic with headers
-  args = [ ...common, "-g", tiktokUrl ];
-  try {
-    const { stdout } = await exec("yt-dlp", args);
-    const url = stdout.trim().split("\n").pop();
-    if (url) return url;
-  } catch (e) {
-    console.warn("yt-dlp generic failed:", e?.stderr || e?.message || e);
-  }
+  // 2) Mobile path, best MP4
+  args = [
+    ...common,
+    "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
+    "-g", "-f", "mp4*+bestaudio/best/best", url
+  ];
+  r = await execYtDlp(args);
+  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
 
-  // 3) Best audio only (smaller for transcription)
-  args = [ ...common, "-g", "-f", "bestaudio/best", tiktokUrl ];
-  const { stdout } = await exec("yt-dlp", args); // let error bubble here
-  const url = stdout.trim().split("\n").pop();
-  if (!url) throw new Error("Could not resolve TikTok media URL");
-  return url;
+  // 3) Generic with headers
+  args = [ ...common, "-g", url ];
+  r = await execYtDlp(args);
+  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
+
+  throw new Error(r.stderr || "Could not resolve TikTok media URL");
 }
 
 // ---------- AssemblyAI ----------
@@ -159,6 +178,7 @@ async function processJob(id) {
     const analysis = analyzeTranscript(transcript);
     upd.run("completed", now(), null, transcript, JSON.stringify(analysis), id);
   } catch (err) {
+    console.error("[job error]", err?.stack || String(err));
     upd.run("error", now(), String(err), null, null, id);
   }
 }
@@ -210,4 +230,6 @@ app.get("/scripts", (req, res) => {
 });
 
 app.get("/", (_, res) => res.send("OK"));
+app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
 app.listen(PORT, () => console.log("server on :" + PORT));
