@@ -1,23 +1,24 @@
-# Node + yt-dlp image for easy deploy
-FROM node:20-bullseye
+# Use Node.js base image
+FROM node:18
 
-# Install yt-dlp
-RUN apt-get update && apt-get install -y yt-dlp && rm -rf /var/lib/apt/lists/*
+# Install dependencies for yt-dlp
+RUN apt-get update && \
+    apt-get install -y curl ffmpeg python3 python3-pip && \
+    pip3 install --no-cache-dir yt-dlp && \
+    rm -rf /var/lib/apt/lists/*
 
-# Workdir
+# Set working directory
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* /app/
-
-# Install deps
+# Copy package.json and install dependencies
+COPY package*.json ./
 RUN npm install --production
 
-# Copy source
-COPY . /app
+# Copy the rest of the application
+COPY . .
 
-# Expose port
+# Expose the port your app runs on
 EXPOSE 3000
 
-# Start
+# Start the app
 CMD ["node", "server.js"]
