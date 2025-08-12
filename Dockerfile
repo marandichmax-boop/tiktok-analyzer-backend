@@ -1,24 +1,23 @@
-# Use Node.js base image
-FROM node:18
+# Stable Node + Debian Bookworm
+FROM node:18-bookworm
 
-# Install dependencies for yt-dlp
+# OS deps (ffmpeg for media), Python + venv
 RUN apt-get update && \
-    apt-get install -y curl ffmpeg python3 python3-pip && \
-    pip3 install --no-cache-dir yt-dlp && \
+    apt-get install -y ffmpeg python3 python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
-# Set working directory
-WORKDIR /app
+# Create a venv so pip can install cleanly (avoids Debian pip restrictions)
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
-# Copy package.json and install dependencies
+# Install yt-dlp into the venv
+RUN pip install --no-cache-dir yt-dlp
+
+# App
+WORKDIR /app
 COPY package*.json ./
 RUN npm install --production
-
-# Copy the rest of the application
 COPY . .
 
-# Expose the port your app runs on
 EXPOSE 3000
-
-# Start the app
 CMD ["node", "server.js"]
