@@ -1,4 +1,14 @@
-// TikTok Analyzer Backend
+// TikTok Analyzer Backend (full file)
+// - Accepts TikTok link -> resolves media via yt-dlp (mobile UA + extractor args)
+// - Transcribes via AssemblyAI
+// - Runs quick heuristic analysis
+// - Stores jobs + scripts in SQLite (better-sqlite3)
+// Endpoints:
+//   POST /jobs { tiktokUrl } -> { id, status }
+//   GET  /jobs/:id           -> { status, transcript, analysis, ... }
+//   POST /scripts            -> { id }
+//   GET  /scripts            -> list saved
+
 import express from "express";
 import cors from "cors";
 import Database from "better-sqlite3";
@@ -7,9 +17,14 @@ import fetch from "node-fetch";
 import { promisify } from "util";
 
 const exec = promisify(execFile);
-const AAI_KEY = process.env.AAI_KEY; // Set this in your host's environment
+const AAI_KEY = process.env.AAI_KEY; // <- set this in Render Environment
 const PORT = process.env.PORT || 3000;
 
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ---------- DB ----------
 const db = new Database("data.db");
 db.exec(`
 CREATE TABLE IF NOT EXISTS jobs (
@@ -32,29 +47,29 @@ CREATE TABLE IF NOT EXISTS scripts (
 );
 `);
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const now = () => new Date().toISOString();
 
+// ---------- Analysis ----------
 function analyzeTranscript(txt) {
-  const lower = txt.toLowerCase();
+  const lower = (txt || "").toLowerCase();
   const metrics = {
     length_chars: txt.length,
     length_words: (txt.match(/\b\w+\b/g) || []).length,
-    has_numbers: /\d/.test(txt),
-    power_words: (lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || []),
-    risky_claims: (lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || []),
+    has_numbers: /\d/.test(lower),
+    power_words:
+      lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || [],
+    risky_claims:
+      lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || [],
     cta_lines: (txt.match(/(link|buy|shop|tap|order|try|today|now)[^\n]*$/gim) || []),
   };
-  const hasHook = /^[^\n]{0,150}/.test(txt);
+  const hasHook = /^[^\n]{1,150}/.test(txt);
   const hookScore =
     (metrics.power_words.length > 0 ? 0.3 : 0) +
     (metrics.has_numbers ? 0.2 : 0) +
     (hasHook ? 0.3 : 0) +
     (metrics.length_words >= 30 && metrics.length_words <= 220 ? 0.2 : 0);
+
   const structure = {
     prehook: txt.split("\n")[0] || "",
     cta: metrics.cta_lines.slice(-1)[0] || "",
@@ -63,16 +78,53 @@ function analyzeTranscript(txt) {
   return { metrics, hook_score: +hookScore.toFixed(2), structure };
 }
 
+// ---------- TikTok resolver (yt-dlp with mobile UA + extractor args) ----------
 async function resolveDirectMedia(tiktokUrl) {
-  const { stdout } = await exec("yt-dlp", ["-g", tiktokUrl]);
-  const mediaUrl = stdout.trim().split("\n").pop();
-  if (!mediaUrl) throw new Error("No media URL from yt-dlp");
-  return mediaUrl;
+  const common = [
+    "--no-warnings",
+    "--geo-bypass",
+    "--no-check-certificate",
+    "--referer", "https://www.tiktok.com/",
+    "--user-agent",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+  ];
+
+  // 1) Mobile API path (more reliable)
+  let args = [
+    ...common,
+    "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
+    "-g", tiktokUrl
+  ];
+  try {
+    const { stdout } = await exec("yt-dlp", args);
+    const url = stdout.trim().split("\n").pop();
+    if (url) return url;
+  } catch (e) {
+    console.warn("yt-dlp mobile path failed:", e?.stderr || e?.message || e);
+  }
+
+  // 2) Generic with headers
+  args = [ ...common, "-g", tiktokUrl ];
+  try {
+    const { stdout } = await exec("yt-dlp", args);
+    const url = stdout.trim().split("\n").pop();
+    if (url) return url;
+  } catch (e) {
+    console.warn("yt-dlp generic failed:", e?.stderr || e?.message || e);
+  }
+
+  // 3) Best audio only (smaller for transcription)
+  args = [ ...common, "-g", "-f", "bestaudio/best", tiktokUrl ];
+  const { stdout } = await exec("yt-dlp", args); // let error bubble here
+  const url = stdout.trim().split("\n").pop();
+  if (!url) throw new Error("Could not resolve TikTok media URL");
+  return url;
 }
 
+// ---------- AssemblyAI ----------
 async function transcribeWithAAI(mediaUrl) {
   if (!AAI_KEY) throw new Error("Missing AAI_KEY env");
-  const job = await fetch("https://api.assemblyai.com/v2/transcript", {
+  const start = await fetch("https://api.assemblyai.com/v2/transcript", {
     method: "POST",
     headers: { Authorization: AAI_KEY, "Content-Type": "application/json" },
     body: JSON.stringify({ audio_url: mediaUrl }),
@@ -80,7 +132,7 @@ async function transcribeWithAAI(mediaUrl) {
 
   for (let i = 0; i < 120; i++) {
     await new Promise(r => setTimeout(r, 2500));
-    const s = await fetch(`https://api.assemblyai.com/v2/transcript/${job.id}`, {
+    const s = await fetch(`https://api.assemblyai.com/v2/transcript/${start.id}`, {
       headers: { Authorization: AAI_KEY }
     }).then(r => r.json());
     if (s.status === "completed") return s.text || "";
@@ -89,6 +141,7 @@ async function transcribeWithAAI(mediaUrl) {
   throw new Error("AAI timeout");
 }
 
+// ---------- Worker ----------
 async function processJob(id) {
   const get = db.prepare("SELECT * FROM jobs WHERE id=?");
   const upd = db.prepare("UPDATE jobs SET status=?, updated_at=?, error=?, transcript=?, analysis_json=? WHERE id=?");
@@ -104,20 +157,20 @@ async function processJob(id) {
     const transcript = await transcribeWithAAI(mediaUrl);
 
     const analysis = analyzeTranscript(transcript);
-
     upd.run("completed", now(), null, transcript, JSON.stringify(analysis), id);
   } catch (err) {
     upd.run("error", now(), String(err), null, null, id);
   }
 }
 
+// ---------- Routes ----------
 app.post("/jobs", (req, res) => {
   const { tiktokUrl } = req.body || {};
   if (!tiktokUrl) return res.status(400).json({ error: "tiktokUrl required" });
   const id = uid();
   db.prepare("INSERT INTO jobs (id, tiktok_url, status, created_at, updated_at) VALUES (?,?,?,?,?)")
     .run(id, tiktokUrl, "queued", now(), now());
-  processJob(id);
+  processJob(id); // fire-and-forget
   res.json({ id, status: "queued" });
 });
 
