@@ -1,4 +1,10 @@
-// TikTok Analyzer Backend (with robust resolver + logging)
+// TikTok Analyzer Backend — robust resolver + logging
+// Endpoints:
+//   POST /jobs { tiktokUrl } -> { id, status }
+//   GET  /jobs/:id           -> { status, transcript, analysis, error? }
+//   POST /scripts            -> save transcript+analysis
+//   GET  /scripts            -> list saved
+//   GET  /health             -> quick check
 
 import express from "express";
 import cors from "cors";
@@ -6,10 +12,12 @@ import Database from "better-sqlite3";
 import { execFile } from "child_process";
 import fetch from "node-fetch";
 import { promisify } from "util";
+import fs from "fs";
 
 const exec = promisify(execFile);
-const AAI_KEY = process.env.AAI_KEY;            // set in Render Environment
-const PORT   = process.env.PORT || 3000;
+const AAI_KEY = process.env.AAI_KEY;               // REQUIRED (AssemblyAI key)
+const TTK_COOKIES = process.env.TIKTOK_COOKIES||""; // OPTIONAL (Netscape cookies)
+const PORT = process.env.PORT || 3000;
 
 // ---------- App & DB ----------
 const app = express();
@@ -42,132 +50,112 @@ const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const now = () => new Date().toISOString();
 
 // ---------- Helpers ----------
-function analyzeTranscript(txt) {
-  const lower = (txt || "").toLowerCase();
-  const metrics = {
-    length_chars: txt.length,
-    length_words: (txt.match(/\b\w+\b/g) || []).length,
-    has_numbers: /\d/.test(lower),
-    power_words: (lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || []),
-    risky_claims: (lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || []),
-    cta_lines: (txt.match(/(link|buy|shop|tap|order|try|today|now)[^\n]*$/gim) || []),
-  };
+function analyzeTranscript(txt="") {
+  const lower = txt.toLowerCase();
+  const words = (txt.match(/\b\w+\b/g) || []).length;
+  const power = lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || [];
+  const risky = lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || [];
+  const ctas  = txt.match(/(link|buy|shop|tap|order|try|today|now)[^\n]*$/gim) || [];
   const hasHook = /^[^\n]{1,150}/.test(txt);
-  const hookScore =
-    (metrics.power_words.length > 0 ? 0.3 : 0) +
-    (metrics.has_numbers ? 0.2 : 0) +
-    (hasHook ? 0.3 : 0) +
-    (metrics.length_words >= 30 && metrics.length_words <= 220 ? 0.2 : 0);
-  const structure = {
-    prehook: txt.split("\n")[0] || "",
-    cta: metrics.cta_lines.slice(-1)[0] || "",
-    has_risky_claims: metrics.risky_claims.length > 0,
+  const hook = (power.length?0.3:0) + (/\d/.test(lower)?0.2:0) + (hasHook?0.3:0) + (words>=30&&words<=220?0.2:0);
+  return {
+    metrics:{ length_chars:txt.length, length_words:words, has_numbers:/\d/.test(lower), power_words:power, risky_claims:risky, cta_lines:ctas },
+    hook_score:+hook.toFixed(2),
+    structure:{ prehook: (txt.split("\n")[0]||""), cta: ctas.slice(-1)[0]||"", has_risky_claims: risky.length>0 }
   };
-  return { metrics, hook_score: +hookScore.toFixed(2), structure };
 }
 
-// Try to coerce to a clean share link if user pasted a long webapp URL
+// Normalize weird long URLs to a clean share link if we can
 function normalizeTikTokUrl(input) {
   try {
     const u = new URL(input);
-    // If it's already a share link, keep it
     if (/tiktok\.com$/i.test(u.hostname) && /\/video\/\d+/.test(u.pathname)) return input;
-
-    // Some long URLs contain the numeric video id in a query string; extract it
-    const idInQS =
+    const id =
       u.searchParams.get("video_id") ||
       u.searchParams.get("item_id") ||
       (u.pathname.match(/\/video\/(\d+)/)?.[1]) ||
       (u.search.match(/[\?&](?:video_id|item_id)=(\d+)/)?.[1]);
-
-    if (idInQS) {
-      // Username is not required: /video/<id> works
-      return `https://www.tiktok.com/video/${idInQS}`;
-    }
+    if (id) return `https://www.tiktok.com/video/${id}`;
   } catch {}
-  return input; // fallback to original; yt-dlp may still handle it
+  return input;
+}
+
+let cookiesFile = "";
+if (TTK_COOKIES) {
+  cookiesFile = "/tmp/tiktok_cookies.txt";
+  try { fs.writeFileSync(cookiesFile, TTK_COOKIES, "utf8"); } catch {}
 }
 
 async function execYtDlp(args) {
   try {
     const { stdout, stderr } = await exec("yt-dlp", args);
     if (stderr?.trim()) console.warn("[yt-dlp stderr]", stderr.trim());
-    return { ok: true, stdout: stdout.trim(), stderr: stderr?.trim() || "" };
+    return { ok:true, out: (stdout||"").trim(), err: (stderr||"").trim() };
   } catch (e) {
-    const out = (e.stdout || "").toString().trim();
-    const err = (e.stderr || e.message || String(e)).toString().trim();
+    const out = (e.stdout||"").toString().trim();
+    const err = (e.stderr||e.message||String(e)).toString().trim();
     console.warn("[yt-dlp FAIL]", err);
-    return { ok: false, stdout: out, stderr: err };
+    return { ok:false, out, err };
   }
 }
 
-// ---------- TikTok resolver (mobile UA + extractor args + fallbacks) ----------
+// Resolve playable media (audio-first, then full) with mobile UA + extractor args
 async function resolveDirectMedia(tiktokUrl) {
   const url = normalizeTikTokUrl(tiktokUrl);
-
   const common = [
     "--no-warnings",
     "--geo-bypass",
     "--no-check-certificate",
-    "--referer", "https://www.tiktok.com/",
-    "--user-agent",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
+    ...(cookiesFile ? ["--cookies", cookiesFile] : []),
+    "--referer","https://www.tiktok.com/",
+    "--user-agent","Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1"
   ];
 
-  // 1) Best AUDIO first (fastest & least blocked for transcription)
-  let args = [
-    ...common,
-    "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
-    "-g", "-f", "bestaudio/best", url
-  ];
+  // 1) Best AUDIO (fastest + least blocked)
+  let args = [...common, "--extractor-args","tiktok:app_info=android;download_api=tiktok", "-g","-f","bestaudio/best", url];
   let r = await execYtDlp(args);
-  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
+  if (r.ok && r.out) return r.out.split("\n").pop();
 
-  // 2) Mobile path, best MP4
-  args = [
-    ...common,
-    "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
-    "-g", "-f", "mp4*+bestaudio/best/best", url
-  ];
+  // 2) Best MP4 via mobile path
+  args = [...common, "--extractor-args","tiktok:app_info=android;download_api=tiktok", "-g","-f","mp4*+bestaudio/best/best", url];
   r = await execYtDlp(args);
-  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
+  if (r.ok && r.out) return r.out.split("\n").pop();
 
   // 3) Generic with headers
-  args = [ ...common, "-g", url ];
+  args = [...common, "-g", url];
   r = await execYtDlp(args);
-  if (r.ok && r.stdout) return r.stdout.split("\n").pop();
+  if (r.ok && r.out) return r.out.split("\n").pop();
 
-  throw new Error(r.stderr || "Could not resolve TikTok media URL");
+  throw new Error(r.err || "Could not resolve TikTok media URL");
 }
 
 // ---------- AssemblyAI ----------
 async function transcribeWithAAI(mediaUrl) {
   if (!AAI_KEY) throw new Error("Missing AAI_KEY env");
   const start = await fetch("https://api.assemblyai.com/v2/transcript", {
-    method: "POST",
-    headers: { Authorization: AAI_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ audio_url: mediaUrl }),
-  }).then(r => r.json());
+    method:"POST",
+    headers:{ Authorization: AAI_KEY, "Content-Type":"application/json" },
+    body: JSON.stringify({ audio_url: mediaUrl })
+  }).then(r=>r.json());
 
-  for (let i = 0; i < 120; i++) {
-    await new Promise(r => setTimeout(r, 2500));
+  for (let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,2500));
     const s = await fetch(`https://api.assemblyai.com/v2/transcript/${start.id}`, {
-      headers: { Authorization: AAI_KEY }
-    }).then(r => r.json());
-    if (s.status === "completed") return s.text || "";
-    if (s.status === "error") throw new Error(s.error || "AAI error");
+      headers:{ Authorization: AAI_KEY }
+    }).then(r=>r.json());
+    if (s.status==="completed") return s.text||"";
+    if (s.status==="error") throw new Error(s.error||"AAI error");
   }
   throw new Error("AAI timeout");
 }
 
 // ---------- Worker ----------
-async function processJob(id) {
+async function processJob(id){
   const get = db.prepare("SELECT * FROM jobs WHERE id=?");
   const upd = db.prepare("UPDATE jobs SET status=?, updated_at=?, error=?, transcript=?, analysis_json=? WHERE id=?");
-
-  try {
+  try{
     const row = get.get(id);
-    if (!row || row.status !== "queued") return;
+    if(!row || row.status!=="queued") return;
 
     upd.run("resolving", now(), null, null, null, id);
     const mediaUrl = await resolveDirectMedia(row.tiktok_url);
@@ -177,26 +165,26 @@ async function processJob(id) {
 
     const analysis = analyzeTranscript(transcript);
     upd.run("completed", now(), null, transcript, JSON.stringify(analysis), id);
-  } catch (err) {
-    console.error("[job error]", err?.stack || String(err));
+  }catch(err){
+    console.error("[job error]", err?.stack||String(err));
     upd.run("error", now(), String(err), null, null, id);
   }
 }
 
 // ---------- Routes ----------
-app.post("/jobs", (req, res) => {
-  const { tiktokUrl } = req.body || {};
-  if (!tiktokUrl) return res.status(400).json({ error: "tiktokUrl required" });
+app.post("/jobs",(req,res)=>{
+  const { tiktokUrl } = req.body||{};
+  if(!tiktokUrl) return res.status(400).json({ error:"tiktokUrl required" });
   const id = uid();
-  db.prepare("INSERT INTO jobs (id, tiktok_url, status, created_at, updated_at) VALUES (?,?,?,?,?)")
+  db.prepare("INSERT INTO jobs (id,tiktok_url,status,created_at,updated_at) VALUES (?,?,?,?,?)")
     .run(id, tiktokUrl, "queued", now(), now());
-  processJob(id); // fire-and-forget
-  res.json({ id, status: "queued" });
+  processJob(id);
+  res.json({ id, status:"queued" });
 });
 
-app.get("/jobs/:id", (req, res) => {
+app.get("/jobs/:id",(req,res)=>{
   const row = db.prepare("SELECT * FROM jobs WHERE id=?").get(req.params.id);
-  if (!row) return res.status(404).json({ error: "not found" });
+  if(!row) return res.status(404).json({ error:"not found" });
   res.json({
     id: row.id,
     tiktokUrl: row.tiktok_url,
@@ -208,28 +196,23 @@ app.get("/jobs/:id", (req, res) => {
   });
 });
 
-app.post("/scripts", (req, res) => {
-  const { title, sourceUrl, transcript, analysis } = req.body || {};
-  if (!transcript) return res.status(400).json({ error: "transcript required" });
+app.post("/scripts",(req,res)=>{
+  const { title, sourceUrl, transcript, analysis } = req.body||{};
+  if(!transcript) return res.status(400).json({ error:"transcript required" });
   const id = uid();
   db.prepare("INSERT INTO scripts (id,title,source_url,transcript,analysis_json,created_at) VALUES (?,?,?,?,?,?)")
-    .run(id, title || "Untitled", sourceUrl || "", transcript, JSON.stringify(analysis || {}), now());
+    .run(id, title||"Untitled", sourceUrl||"", transcript, JSON.stringify(analysis||{}), now());
   res.json({ id });
 });
 
-app.get("/scripts", (req, res) => {
+app.get("/scripts",(req,res)=>{
   const rows = db.prepare("SELECT * FROM scripts ORDER BY created_at DESC LIMIT 200").all();
-  res.json(rows.map(r => ({
-    id: r.id,
-    title: r.title,
-    sourceUrl: r.source_url,
-    transcript: r.transcript,
-    analysis: r.analysis_json ? JSON.parse(r.analysis_json) : null,
-    createdAt: r.created_at
+  res.json(rows.map(r=>({
+    id:r.id, title:r.title, sourceUrl:r.source_url, transcript:r.transcript,
+    analysis: r.analysis_json?JSON.parse(r.analysis_json):null, createdAt:r.created_at
   })));
 });
 
-app.get("/", (_, res) => res.send("OK"));
-app.get("/health", (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-app.listen(PORT, () => console.log("server on :" + PORT));
+app.get("/health",(_,res)=>res.json({ ok:true, time:new Date().toISOString() }));
+app.get("/", (_,res)=>res.send("OK"));
+app.listen(PORT,()=>console.log("server on :"+PORT));
