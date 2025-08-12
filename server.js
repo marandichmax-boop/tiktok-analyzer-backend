@@ -1,5 +1,6 @@
-// TikTok Link -> (server downloads AUDIO) -> upload to AssemblyAI -> transcript
-// No cookies needed. Mobile UA, audio-first, proxy support, EU-ready.
+// TikTok → (server downloads AUDIO bytes) → upload to AssemblyAI → transcript
+// No cookies required. Mobile UA + TikTok extractor args. Better AAI options.
+// Includes richer analysis metrics.
 
 import express from "express";
 import cors from "cors";
@@ -8,8 +9,8 @@ import { spawn } from "child_process";
 import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 3000;
-const AAI_KEY = process.env.AAI_KEY;                 // REQUIRED (AssemblyAI key)
-const YTDLP_PROXY = process.env.YTDLP_PROXY || "";   // OPTIONAL, e.g. http://eu-proxy:3128
+const AAI_KEY = process.env.AAI_KEY;               // REQUIRED
+const YTDLP_PROXY = process.env.YTDLP_PROXY || ""; // OPTIONAL (e.g., http://eu-proxy:3128)
 
 const app = express();
 app.use(cors());
@@ -41,24 +42,73 @@ CREATE TABLE IF NOT EXISTS scripts (
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
 const now = () => new Date().toISOString();
 
-// -------------- Helpers --------------
+// ---------------- Analysis ----------------
 function analyzeTranscript(txt = "") {
   const lower = txt.toLowerCase();
-  const words = (txt.match(/\b\w+\b/g) || []).length;
-  const hasNums = /\d/.test(lower);
-  const power = lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study)\b/g) || [];
-  const risky = lower.match(/\b(cure|guarantee|instant|permanent|miracle)\b/g) || [];
-  const ctas  = txt.match(/(link|buy|shop|tap|order|try|today|now)[^\n]*$/gim) || [];
-  const hasHook = /^[^\n]{1,150}/.test(txt);
-  const hook = (power.length?0.3:0) + (hasNums?0.2:0) + (hasHook?0.3:0) + (words>=30&&words<=220?0.2:0);
+
+  // Tokenization-ish helpers
+  const wordsArr = (txt.match(/\b[\p{L}\p{N}'-]+\b/gu) || []);
+  const words = wordsArr.length;
+  const sentencesArr = (txt.split(/[.!?]+[\s\n]+/).map(s => s.trim()).filter(Boolean));
+  const sentences = Math.max(1, sentencesArr.length);
+  const avgWordsPerSentence = +(words / sentences).toFixed(2);
+
+  const numbersCount = (txt.match(/\b\d+(?:[.,]\d+)?\b/g) || []).length;
+  const exclamationsCount = (txt.match(/!/g) || []).length;
+  const questionsCount = (txt.match(/\?/g) || []).length;
+
+  const powerWords =
+    lower.match(/\b(shock|insane|secret|proof|hack|guarantee|science|doctor|study|instant|boost|breakthrough|viral|free|limited)\b/g) || [];
+  const riskyClaims =
+    lower.match(/\b(cure|guarantee|permanent|miracle|overnight|instantly|no\s*risk)\b/g) || [];
+  const ctaLines = (txt.match(/^(.*?(link|buy|shop|tap|order|try|subscribe|follow|download|today|now).*)$/gim) || []);
+
+  // Super lightweight sentiment (bag-of-words)
+  const posWords = ["good","great","amazing","win","love","best","easy","success","benefit","fast","wow","wow!","save","safe"];
+  const negWords = ["bad","worse","worst","hate","risk","scam","hard","problem","pain","danger","fail","loss"];
+  let score = 0;
+  for (const w of wordsArr.map(w => w.toLowerCase())) {
+    if (posWords.includes(w)) score += 1;
+    if (negWords.includes(w)) score -= 1;
+  }
+  const sentimentScore = words ? +(score / Math.sqrt(words)).toFixed(2) : 0;
+
+  // Hook score
+  const prehook = txt.split("\n")[0] || "";
+  const hasHook = prehook.length > 0 && prehook.length <= 150;
+  const hookScore =
+    (powerWords.length > 0 ? 0.3 : 0) +
+    (numbersCount > 0 ? 0.2 : 0) +
+    (hasHook ? 0.3 : 0) +
+    (words >= 30 && words <= 220 ? 0.2 : 0);
+
+  const readingTimeSec = +(words / 150 * 60).toFixed(1); // 150 wpm
+
   return {
-    metrics: { length_chars: txt.length, length_words: words, has_numbers: hasNums, power_words: power, risky_claims: risky, cta_lines: ctas },
-    hook_score: +hook.toFixed(2),
-    structure: { prehook: txt.split("\n")[0] || "", cta: ctas.slice(-1)[0] || "", has_risky_claims: risky.length > 0 }
+    metrics: {
+      length_chars: txt.length,
+      length_words: words,
+      sentences,
+      avg_words_per_sentence: avgWordsPerSentence,
+      numbers_count: numbersCount,
+      power_words: powerWords,
+      risky_claims: riskyClaims,
+      cta_lines: ctaLines,
+      exclamations_count: exclamationsCount,
+      questions_count: questionsCount,
+      reading_time_sec: readingTimeSec,
+      sentiment_score: sentimentScore
+    },
+    hook_score: +hookScore.toFixed(2),
+    structure: {
+      prehook,
+      cta: ctaLines.slice(-1)[0] || "",
+      has_risky_claims: riskyClaims.length > 0
+    }
   };
 }
 
-// Normalize odd long URLs to a clean share URL if possible
+// ---------------- TikTok helpers ----------------
 function normalizeTikTokUrl(input) {
   try {
     const u = new URL(input);
@@ -73,7 +123,7 @@ function normalizeTikTokUrl(input) {
   return input;
 }
 
-// Download AUDIO bytes with yt-dlp (mobile UA, extractor args). No temp files.
+// Download AUDIO bytes with yt-dlp (mobile UA, extractor args) to stdout
 async function downloadAudioBytes(tiktokUrl) {
   const url = normalizeTikTokUrl(tiktokUrl);
   const args = [
@@ -85,7 +135,7 @@ async function downloadAudioBytes(tiktokUrl) {
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
     "--extractor-args", "tiktok:app_info=android;download_api=tiktok",
     "-f", "bestaudio/best",
-    "-o", "-",                 // write media to stdout
+    "-o", "-",
     url
   ];
   if (YTDLP_PROXY) { args.unshift(YTDLP_PROXY); args.unshift("--proxy"); }
@@ -97,18 +147,14 @@ async function downloadAudioBytes(tiktokUrl) {
 
     child.stdout.on("data", d => chunks.push(d));
     child.stderr.on("data", d => (errText += d.toString()));
-
     child.on("close", code => {
-      if (code === 0 && chunks.length) {
-        resolve(Buffer.concat(chunks));
-      } else {
-        reject(new Error(errText || `yt-dlp exited with code ${code}`));
-      }
+      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
+      else reject(new Error(errText || `yt-dlp exited with code ${code}`));
     });
   });
 }
 
-// Upload bytes to AssemblyAI, get an upload_url back
+// ---------------- AssemblyAI ----------------
 async function aaiUpload(buffer) {
   if (!AAI_KEY) throw new Error("Missing AAI_KEY env");
   const resp = await fetch("https://api.assemblyai.com/v2/upload", {
@@ -117,20 +163,33 @@ async function aaiUpload(buffer) {
     body: buffer
   });
   const text = await resp.text();
-  try {
-    const j = JSON.parse(text);
-    return j.upload_url || j.url || text;
-  } catch {
-    return text; // some SDKs return raw URL
-  }
+  try { const j = JSON.parse(text); return j.upload_url || j.url || text; }
+  catch { return text; }
 }
 
-// Poll AssemblyAI until done
-async function aaiTranscribeFromUploadUrl(uploadUrl) {
+async function transcribeWithAAI(uploadUrl) {
+  if (!AAI_KEY) throw new Error("Missing AAI_KEY env");
+
   const start = await fetch("https://api.assemblyai.com/v2/transcript", {
     method: "POST",
     headers: { Authorization: AAI_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ audio_url: uploadUrl })
+    body: JSON.stringify({
+      audio_url: uploadUrl,
+
+      // Quality + readability
+      punctuate: true,
+      format_text: true,
+      audio_boost: true,
+
+      // Robust language handling
+      language_detection: true,
+
+      // Useful extras (keep off in UI unless you want to surface them)
+      auto_highlights: true,
+      entity_detection: true,
+      iab_categories: false,
+      speaker_labels: false
+    })
   }).then(r => r.json());
 
   for (let i = 0; i < 120; i++) {
@@ -144,7 +203,7 @@ async function aaiTranscribeFromUploadUrl(uploadUrl) {
   throw new Error("AAI timeout");
 }
 
-// Single worker pipeline (no cookies): TikTok -> audio bytes -> AAI upload -> transcript
+// ---------------- Worker ----------------
 async function processJob(id) {
   const get = db.prepare("SELECT * FROM jobs WHERE id=?");
   const upd = db.prepare("UPDATE jobs SET status=?, updated_at=?, error=?, transcript=?, analysis_json=? WHERE id=?");
@@ -154,13 +213,13 @@ async function processJob(id) {
     if (!row || row.status !== "queued") return;
 
     upd.run("downloading", now(), null, null, null, id);
-    const audio = await downloadAudioBytes(row.tiktok_url); // <- critical change
+    const audio = await downloadAudioBytes(row.tiktok_url);
 
     upd.run("uploading", now(), null, null, null, id);
     const uploadUrl = await aaiUpload(audio);
 
     upd.run("transcribing", now(), null, null, null, id);
-    const transcript = await aaiTranscribeFromUploadUrl(uploadUrl);
+    const transcript = await transcribeWithAAI(uploadUrl);
 
     const analysis = analyzeTranscript(transcript);
     upd.run("completed", now(), null, transcript, JSON.stringify(analysis), id);
